@@ -1,0 +1,69 @@
+# PXL Classroom - broker watch:started handler.
+#
+# SECURITY MODEL:
+# This workflow lives on a PUBLIC broker repo's default branch (one per assignment).
+# When a student stars the broker, GitHub fires watch:started. This workflow validates
+# the actor and dispatches a repository_dispatch event to the CENTRAL pxl-classroom repo.
+#
+# To do this, it mints an installation token for the PXL Classroom Provisioner App.
+# The App installation is scoped explicitly to the PXL-Digital-Application-Samples org
+# and the pxl-classroom repository ONLY. Therefore, a compromised broker workflow can
+# only dispatch events to pxl-classroom. Bounded blast radius.
+#
+# Secrets required:
+#   PXL_APP_CLIENT_ID      - Provisioning App Client ID (Iv… string)
+#   PXL_APP_PRIVATE_KEY    - Provisioning App private key (PEM)
+#
+# Variables required:
+#   ASSIGNMENT_ID          - set when publish-assignment creates this repo
+#   CONTROL_ORG            - e.g. "PXLAutomation" (the org owning the control repo)
+
+name: Acceptance trigger
+
+on:
+  watch:
+    types: [started]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: accept-${{ github.actor }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    if: github.event.action == 'started'
+    steps:
+      - name: Validate actor
+        id: validate
+        shell: bash
+        run: |
+          [[ -n "${{ github.actor }}" && -n "${{ github.event.sender.id }}" ]] \
+            || { echo "::error::Missing actor"; exit 1; }
+          echo "actor=${{ github.actor }}"       >> "$GITHUB_OUTPUT"
+          echo "actor_id=${{ github.event.sender.id }}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint dispatcher token
+        id: token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.PXL_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PXL_APP_PRIVATE_KEY }}
+          owner: PXL-Digital-Application-Samples
+          repositories: pxl-classroom
+
+      - name: Dispatch to central pxl-classroom
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          gh api --method POST \
+            "/repos/PXL-Digital-Application-Samples/pxl-classroom/dispatches" \
+            -f "event_type=acceptance" \
+            -f "client_payload[org]=${{ vars.CONTROL_ORG }}" \
+            -f "client_payload[assignment_id]=${{ vars.ASSIGNMENT_ID }}" \
+            -f "client_payload[github_login]=${{ steps.validate.outputs.actor }}" \
+            -f "client_payload[github_id]=${{ steps.validate.outputs.actor_id }}" \
+            -f "client_payload[workflow_run_url]=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
