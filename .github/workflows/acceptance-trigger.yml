@@ -1,51 +1,183 @@
-# PXL Classroom - broker watch:started handler.
+# PXL Classroom - broker acceptance handler.
 #
 # SECURITY MODEL:
 # This workflow lives on a PUBLIC broker repo's default branch (one per assignment).
-# When a student stars the broker, GitHub fires watch:started. This workflow validates
-# the actor and dispatches a repository_dispatch event to the CENTRAL pxl-classroom repo.
+# Acceptance is triggered by a public event on a public repository, so anyone can
+# ring the doorbell. What stops an outsider from causing work is the SIGNED
+# INVITATION TOKEN in the issue title: it is verified here, from a checkout of the
+# public hub, BEFORE any credential is in scope. A caller without a valid token
+# costs one boot on a free public runner - no App token minted, no hub run, no
+# clone of the private control repo.
 #
-# To do this, it mints an installation token for the PXL Classroom Provisioner App.
-# The App installation is scoped explicitly to the PXL-Digital-Application-Samples org
-# and the pxl-classroom repository ONLY. Therefore, a compromised broker workflow can
-# only dispatch events to pxl-classroom. Bounded blast radius.
+# The verifier is public, which is why the signature is asymmetric. Only the
+# PUBLIC key is readable here (hub: acceptance/invite-keys.json); the signing key
+# never leaves the hub. See ARCHITECTURE §4.3.2 and lib/invite-token.mjs.
+#
+# NO ATTACKER-CONTROLLED TEXT MAY REACH A SHELL HERE. This repository carries
+# PXL_APP_PRIVATE_KEY as a repo secret, and any GitHub account can open an issue
+# on it. An issue body interpolated into `run:` was arbitrary code execution
+# against that key. Every value below is passed through `env:` - never `${{ }}`
+# inside a script - and the issue BODY is never read here at all: the hub fetches
+# and validates it (scripts/read-team-payload.mjs). See ARCHITECTURE §4.3.1.
 #
 # Secrets required:
 #   PXL_APP_CLIENT_ID      - Provisioning App Client ID (Iv… string)
 #   PXL_APP_PRIVATE_KEY    - Provisioning App private key (PEM)
 #
-# Variables required:
-#   ASSIGNMENT_ID          - set when publish-assignment creates this repo
+# Variables required (all set by publish-assignment.yml):
+#   ASSIGNMENT_ID          - the assignment this broker accepts for
 #   CONTROL_ORG            - e.g. "PXLAutomation" (the org owning the control repo)
+#   INVITE_NONCE           - current invitation generation; rotating it retires
+#                            every link issued before it
+#   INVITE_PUBKEY          - the assignment's acceptance PUBLIC key (P-256, SPKI,
+#                            base64url). Public by design. The student signs with
+#                            the private half, which lives only in their link, so
+#                            the title carries a signature rather than a
+#                            credential - see CLAIM_PLAN Phase A. Absent means
+#                            reject, never "accept anything"
+#   INVITE_ENABLED         - "false" turns acceptance off without deleting anything
 
 name: Acceptance trigger
 
 on:
-  watch:
-    types: [started]
+  issues:
+    types: [opened]
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
-  group: accept-${{ github.actor }}
+  # Serialised per accepting account, and keyed on the same field the signature
+  # and the dispatch use. `github.actor` is a third reading of the same fact.
+  group: accept-${{ github.event.issue.user.login }}
   cancel-in-progress: false
 
 jobs:
   dispatch:
+    # Evaluated BEFORE a runner is allocated. An issue that is not an acceptance
+    # attempt, or an assignment whose invitations are switched off, is skipped
+    # without consuming a runner at all.
+    if: >-
+      github.event.action == 'opened'
+      && startsWith(github.event.issue.title, 'pxl-accept:')
+      && vars.INVITE_ENABLED != 'false'
     runs-on: ubuntu-latest
-    if: github.event.action == 'started'
     steps:
       - name: Validate actor
         id: validate
         shell: bash
+        env:
+          # THE ISSUE'S AUTHOR, not `github.actor` and not `sender`.
+          #
+          # The signature is verified against `issue.user.id`, so provisioning
+          # for anyone else would mean the account we checked and the account we
+          # act for are two different facts read from two different fields. For
+          # a freshly opened issue they agree, which is exactly why a divergence
+          # would be invisible until it was not - an issue opened through an App
+          # on a user's behalf reports the App as `sender` and the user as
+          # `issue.user`.
+          ACTOR: ${{ github.event.issue.user.login }}
+          ACTOR_ID: ${{ github.event.issue.user.id }}
         run: |
-          [[ -n "${{ github.actor }}" && -n "${{ github.event.sender.id }}" ]] \
+          [[ -n "$ACTOR" && -n "$ACTOR_ID" ]] \
             || { echo "::error::Missing actor"; exit 1; }
-          echo "actor=${{ github.actor }}"       >> "$GITHUB_OUTPUT"
-          echo "actor_id=${{ github.event.sender.id }}" >> "$GITHUB_OUTPUT"
+          [[ "$ACTOR" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] \
+            || { echo "::error::Actor is not a valid GitHub login"; exit 1; }
+          [[ "$ACTOR_ID" =~ ^[0-9]+$ ]] \
+            || { echo "::error::Actor id is not numeric"; exit 1; }
+          {
+            echo "actor=$ACTOR"
+            echo "actor_id=$ACTOR_ID"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Parse invitation title
+        id: parse
+        shell: bash
+        env:
+          # Read through env, never interpolated into this script. A bash regex
+          # match against an env var cannot break out the way a substituted
+          # `${{ }}` value can.
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          HINT=""
+          NUMBER=""
+          # Only the TEAM HINT is parsed here. The title itself is handed to the
+          # verifier untouched, because deciding which invitation format a title
+          # is belongs in one place, in JS - a bash regex that matched only the
+          # new shape would make an out-of-date link fail to match at all, and
+          # the student would be told their link was malformed rather than old.
+          RE='^pxl-accept:[A-Za-z0-9_.-]+( team:([a-z0-9][a-z0-9-]{0,63}))?$'
+          if [[ "$ISSUE_TITLE" =~ $RE ]]; then
+            HINT="${BASH_REMATCH[2]}"
+          fi
+          if [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            NUMBER="$ISSUE_NUMBER"
+          fi
+          {
+            echo "team_hint=$HINT"
+            echo "number=$NUMBER"
+          } >> "$GITHUB_OUTPUT"
+
+      # Public repository, no credentials. This is the only third-party action
+      # in the pre-verification path, and the runner's own Node runs the
+      # verifier - lib/invite-token.mjs is Node-builtin-only precisely so that
+      # no `npm ci` is needed on a credential-bearing public repository.
+      - name: Check out the hub
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: PXL-Digital-Application-Samples/pxl-classroom
+          ref: main
+          path: hub
+          persist-credentials: false
+
+      - name: Verify invitation token
+        id: verify
+        shell: bash
+        env:
+          # The title carries a SIGNATURE, not a credential. Read through env,
+          # never interpolated into a script.
+          TITLE: ${{ github.event.issue.title }}
+          INVITE_PUBKEY: ${{ vars.INVITE_PUBKEY }}
+          # The anti-replay check: the signature names the account that made it,
+          # and anyone replaying it out of the public archive is authoring the
+          # issue as themselves, so the two disagree. GitHub sets this; it is
+          # not student-supplied.
+          ISSUE_AUTHOR_ID: ${{ github.event.issue.user.id }}
+          ORG: ${{ vars.CONTROL_ORG }}
+          ASSIGNMENT_ID: ${{ vars.ASSIGNMENT_ID }}
+          INVITE_NONCE: ${{ vars.INVITE_NONCE }}
+          KEYS_FILE: hub/acceptance/invite-keys.json
+        run: node hub/scripts/verify-invite-token.mjs
+
+      - name: Reject invalid invitation
+        if: steps.verify.outputs.valid != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout of this repo, so gh has no remote to infer it from.
+          GH_REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.parse.outputs.number }}
+          REASON: ${{ steps.verify.outputs.reason }}
+        run: |
+          echo "::notice::Invitation rejected (${REASON}) - no credential was used"
+          [ -n "$ISSUE_NUMBER" ] || exit 0
+          # Redact first. A rejection is usually a forged or retired token, but
+          # `wrong-assignment` means a LIVE token for a different assignment was
+          # posted here - and this repository is public. Renaming costs no
+          # credential, so the §4.3.2 floor (a bad token reaches nothing
+          # privileged) still holds.
+          gh issue edit "$ISSUE_NUMBER" --title "Acceptance attempt (rejected)" || true
+          # Deliberately generic: the precise reason stays in this run's log
+          # rather than becoming a probing oracle on a public repository.
+          gh issue comment "$ISSUE_NUMBER" --body \
+            "This invitation link is not valid for this assignment, or is no longer current. Ask your lecturer for an up-to-date link." || true
+          gh issue close "$ISSUE_NUMBER" --reason "not planned" || true
+          gh issue lock "$ISSUE_NUMBER" --reason "resolved" || true
 
       - name: Mint dispatcher token
+        if: steps.verify.outputs.valid == 'true'
         id: token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -55,15 +187,63 @@ jobs:
           repositories: pxl-classroom
 
       - name: Dispatch to central pxl-classroom
+        if: steps.verify.outputs.valid == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
+          CONTROL_ORG: ${{ vars.CONTROL_ORG }}
+          ASSIGNMENT_ID: ${{ vars.ASSIGNMENT_ID }}
+          ACTOR: ${{ steps.validate.outputs.actor }}
+          ACTOR_ID: ${{ steps.validate.outputs.actor_id }}
+          ISSUE_NUMBER: ${{ steps.parse.outputs.number }}
+          TEAM_HINT: ${{ steps.parse.outputs.team_hint }}
+          BROKER_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          gh api --method POST \
-            "/repos/PXL-Digital-Application-Samples/pxl-classroom/dispatches" \
-            -f "event_type=acceptance" \
-            -f "client_payload[org]=${{ vars.CONTROL_ORG }}" \
-            -f "client_payload[assignment_id]=${{ vars.ASSIGNMENT_ID }}" \
-            -f "client_payload[github_login]=${{ steps.validate.outputs.actor }}" \
-            -f "client_payload[github_id]=${{ steps.validate.outputs.actor_id }}" \
-            -f "client_payload[workflow_run_url]=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          ARGS=(
+            "/repos/PXL-Digital-Application-Samples/pxl-classroom/dispatches"
+            -f "event_type=acceptance"
+            -f "client_payload[org]=$CONTROL_ORG"
+            -f "client_payload[assignment_id]=$ASSIGNMENT_ID"
+            -f "client_payload[github_login]=$ACTOR"
+            -f "client_payload[github_id]=$ACTOR_ID"
+            -f "client_payload[broker_repo]=$BROKER_REPO"
+            -f "client_payload[workflow_run_url]=$RUN_URL"
+          )
+          if [ -n "$ISSUE_NUMBER" ]; then
+            ARGS+=(-f "client_payload[issue_number]=$ISSUE_NUMBER")
+          fi
+          if [ -n "$TEAM_HINT" ]; then
+            ARGS+=(-f "client_payload[team_hint]=$TEAM_HINT")
+          fi
+          gh api --method POST "${ARGS[@]}"
+
+      # The trigger issue's TITLE carries the assignment's signed invitation, and
+      # this repository is public. Closing and locking hide nothing - a locked,
+      # closed issue on a public repo is still readable, still listed, and still
+      # returned by GitHub's issue search - so the first student to accept used
+      # to publish the assignment's token to anyone who looked. That collapses
+      # both §4.3.2 (an outsider who never had the link cannot trigger work) and
+      # §4.3.3 (the acceptance card is named sha256(token), so a public token is
+      # a public card, teams file included).
+      #
+      # Redacting the TITLE is what this step can do, and it does it in seconds.
+      # Deleting the issue outright needs ADMIN on the repository, which
+      # `github.token` never has - so the hub does that, after it has read the
+      # group payload out of the body. Deleting here would race that read and
+      # break every group acceptance.
+      #
+      # `gh issue edit --title` needs only `issues: write`, so this costs no
+      # extra credential on a repository that already holds too many.
+      - name: Redact and close trigger issue
+        if: always() && steps.verify.outputs.valid == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.parse.outputs.number }}
+        run: |
+          [ -n "$ISSUE_NUMBER" ] || exit 0
+          gh issue edit "$ISSUE_NUMBER" --title "Acceptance (processed)" || true
+          gh issue close "$ISSUE_NUMBER" --reason "completed" || true
+          gh issue lock "$ISSUE_NUMBER" --reason "resolved" || true

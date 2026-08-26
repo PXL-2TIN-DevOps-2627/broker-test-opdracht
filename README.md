@@ -1,6 +1,6 @@
-# test-opdracht
-
-Assignment acceptance broker. Star this repo to accept the assignment.
+# Assignment acceptance broker
 
 > This is an automated repository managed by PXL Classroom.
-> Accept here: https://pxl-digital-application-samples.github.io/pxl-classroom/PXL-2TIN-DevOps-2627/a/test-opdracht
+
+Acceptance happens through your invitation link, which your lecturer
+distributes. Opening an issue here by hand does nothing.
